@@ -1,154 +1,101 @@
-import * as baileysNs from '@whiskeysockets/baileys';
-import pino from 'pino';
+// Liaison TELEGRAM (remplace l'ancien src/whatsapp.js, mêmes exports : le reste du robot ne change pas)
+// Variables nécessaires : TELEGRAM_BOT_TOKEN (donné par @BotFather) et OWNER_TELEGRAM_ID (ton identifiant Telegram)
 import fs from 'fs';
-import path from 'path';
-import { DATA_DIR, findProspectByPhone, logMessage } from './db.js';
 
-// Compatible avec les différentes façons dont Baileys expose ses exports en ESM
-const root = baileysNs.default && typeof baileysNs.default === 'object' ? baileysNs.default : baileysNs;
-const makeWASocket = typeof root.default === 'function' ? root.default
-  : (root.makeWASocket ?? (typeof baileysNs.default === 'function' ? baileysNs.default : undefined));
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = root;
+const TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const OWNER_IDS = String(process.env.OWNER_TELEGRAM_ID || '').split(',').map(s => s.trim()).filter(Boolean);
+const API = `https://api.telegram.org/bot${TOKEN}`;
 
-const AUTH_DIR = path.join(DATA_DIR, 'auth');
-const digits = s => String(s || '').split('@')[0].split(':')[0].replace(/\D/g, '');
-const list = v => String(v || '').split(',').map(digits).filter(Boolean);
-
-const OWNERS = list(process.env.OWNER_NUMBER);      // ex. 226XXXXXXXX
-const OWNER_LIDS = list(process.env.OWNER_LID);     // optionnel : identifiant @lid du patron
-const PAIRING_NUMBER = digits(process.env.PAIRING_NUMBER);
-
-const state = { connected: false, qr: null, pairingCode: null, ownerJid: null };
-let sock = null;
+const state = { connected: false };
+let handler = null;
+let ownerChat = null;
+let offset = 0;
 let queue = Promise.resolve();
-let onOwnerMessage = null;
 
-export const getStatus = () => ({ connected: state.connected, qr: state.qr, pairingCode: state.pairingCode });
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function unwrap(message) {
-  let m = message;
-  for (let i = 0; i < 4 && m; i++) {
-    m = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.documentWithCaptionMessage?.message || m;
-    if (!m.ephemeralMessage && !m.viewOnceMessage && !m.documentWithCaptionMessage) break;
-  }
-  return m;
+// Même forme que l'ancienne version (la page /qr affichera « connecté »)
+export const getStatus = () => ({ connected: state.connected, qr: null, pairingCode: null });
+
+async function api(method, body, isForm = false) {
+  const res = await fetch(`${API}/${method}`, isForm
+    ? { method: 'POST', body }
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const data = await res.json().catch(() => ({}));
+  if (!data.ok) throw new Error(data.description || `Telegram ${res.status}`);
+  return data.result;
 }
 
-const textOf = message => {
-  const m = unwrap(message) || {};
-  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.videoMessage?.caption || '';
-};
-
-async function reply(jid, text) {
+async function reply(chatId, text) {
   const chunks = String(text).match(/[\s\S]{1,3500}/g) || [];
-  for (const chunk of chunks) await sock.sendMessage(jid, { text: chunk });
+  for (const chunk of chunks) await api('sendMessage', { chat_id: chatId, text: chunk, disable_web_page_preview: true });
+}
+
+async function replyImage(chatId, file, caption) {
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (caption) form.append('caption', String(caption).slice(0, 1000));
+  form.append('photo', new Blob([fs.readFileSync(file)], { type: 'image/png' }), 'visuel.png');
+  await api('sendPhoto', form, true);
 }
 
 export async function sendToOwner(text) {
-  if (!state.connected || !sock) return false;
-  const jid = state.ownerJid || `${OWNERS[0]}@s.whatsapp.net`;
-  await reply(jid, text);
+  const chatId = ownerChat || OWNER_IDS[0];
+  if (!state.connected || !chatId) return false;
+  await reply(chatId, text);
   return true;
 }
 
 async function onMessage(m) {
-  const key = m.key || {};
-  const jid = key.remoteJid;
-  if (!jid || key.fromMe || !m.message) return;
-  if (jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
+  if (!m?.text || m.chat?.type !== 'private') return;
+  const chatId = m.chat.id;
+  const fromId = String(m.from?.id || '');
 
-  const text = textOf(m.message).trim();
+  if (!OWNER_IDS.includes(fromId)) {
+    console.log(`[telegram] Message ignoré (expéditeur non autorisé : ${fromId}). Si c'est toi, ajoute OWNER_TELEGRAM_ID=${fromId} dans les variables d'environnement.`);
+    await reply(chatId, `Ton identifiant Telegram est : ${fromId}\nAjoute-le dans la variable OWNER_TELEGRAM_ID du service sur Render, puis redémarre-le.`).catch(() => {});
+    return;
+  }
+
+  ownerChat = chatId;
+  const text = m.text.replace(/^\/(\w+)@\w+/, '/$1').trim();
   if (!text) return;
 
-  const candidates = [key.remoteJid, key.remoteJidAlt, key.participant, key.participantAlt, key.senderPn].filter(Boolean);
-  const isPN = j => j.endsWith('@s.whatsapp.net');
-  const isOwner = candidates.some(j =>
-    (isPN(j) && OWNERS.includes(digits(j))) || (j.endsWith('@lid') && OWNER_LIDS.includes(digits(j))));
-
-  if (isOwner) {
-    state.ownerJid = jid;
-    try { await sock.sendPresenceUpdate('composing', jid); } catch { /* sans importance */ }
-    const send = t => reply(jid, t);
-    const sendImage = (file, caption) => sock.sendMessage(jid, { image: fs.readFileSync(file), caption });
-    await onOwnerMessage(text, send, sendImage);
-    return;
+  if (text === '/start') {
+    return reply(chatId, 'Robot de prospection DIAO DEV prêt ✅\nExemples : « Cherche des restaurants à Ouaga sans site web », « Rédige le premier message pour … », « Liste les prospects intéressés ». Tape /api pour voir l\'IA utilisée.');
   }
 
-  // Un prospect connu écrit au robot : on garde la trace et on prévient le patron
-  const pn = candidates.find(isPN);
-  const prospect = pn ? findProspectByPhone(digits(pn)) : null;
-  if (prospect) {
-    logMessage(prospect.id, jid, 'in', text);
-    await sendToOwner(`📩 ${prospect.name} a répondu :\n${text}`);
-    return;
-  }
-
-  console.log(`[whatsapp] Message ignoré (expéditeur non autorisé : ${jid})`);
-  if (jid.endsWith('@lid')) {
-    console.log(`[whatsapp] Si c'est toi, ajoute OWNER_LID=${digits(jid)} dans les variables d'environnement.`);
-  }
+  try { await api('sendChatAction', { chat_id: chatId, action: 'typing' }); } catch { /* sans importance */ }
+  const send = t => reply(chatId, t);
+  const sendImage = (file, caption) => replyImage(chatId, file, caption);
+  await handler(text, send, sendImage);
 }
 
-async function connect() {
-  const { state: auth, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
-
-  sock = makeWASocket({
-    version,
-    auth,
-    logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Desktop'),
-    printQRInTerminal: false,
-    syncFullHistory: false,
-    markOnlineOnConnect: false
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      if (PAIRING_NUMBER && !auth.creds.registered) {
-        try {
-          state.pairingCode = await sock.requestPairingCode(PAIRING_NUMBER);
-          console.log(`[whatsapp] Code de jumelage : ${state.pairingCode} (WhatsApp > Appareils connectés > Connecter avec le numéro)`);
-        } catch (e) { console.log('[whatsapp] Jumelage impossible :', e.message); }
+async function poll() {
+  for (;;) {
+    try {
+      const updates = await api('getUpdates', { offset, timeout: 30, allowed_updates: ['message'] });
+      if (!state.connected) console.log('[telegram] Connecté.');
+      state.connected = true;
+      for (const u of updates) {
+        offset = u.update_id + 1;
+        queue = queue.then(() => onMessage(u.message)).catch(e => console.log('[telegram] Erreur :', e.message));
       }
-      state.qr = qr;
-      console.log('[whatsapp] QR prêt : ouvre /qr?token=... sur ton serveur et scanne-le.');
-    }
-
-    if (connection === 'open') {
-      state.connected = true; state.qr = null; state.pairingCode = null;
-      console.log('[whatsapp] Connecté.');
-    }
-
-    if (connection === 'close') {
+    } catch (e) {
       state.connected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut) {
-        console.log('[whatsapp] Session déconnectée depuis le téléphone : nouvelle liaison nécessaire.');
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      } else {
-        console.log(`[whatsapp] Connexion fermée (${code ?? 'inconnu'}), reconnexion...`);
-      }
-      setTimeout(() => connect().catch(e => console.log('[whatsapp] Échec de reconnexion :', e.message)), 3000);
+      console.log('[telegram] Connexion interrompue :', e.message);
+      await sleep(5000);
     }
-  });
-
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const m of messages) {
-      // un seul message traité à la fois, dans l'ordre
-      queue = queue.then(() => onMessage(m)).catch(e => console.log('[whatsapp] Erreur :', e.message));
-    }
-  });
+  }
 }
 
-export async function startWhatsApp(handler) {
-  if (!OWNERS.length) throw new Error('OWNER_NUMBER manquant (ex. 226XXXXXXXX)');
-  if (typeof makeWASocket !== 'function') throw new Error('Baileys introuvable : vérifie l\'installation de @whiskeysockets/baileys');
-  onOwnerMessage = handler;
-  await connect();
+// Le nom startWhatsApp est gardé pour que index.js n'ait pas besoin de changer
+export async function startWhatsApp(onOwnerMessage) {
+  if (!TOKEN) throw new Error('TELEGRAM_BOT_TOKEN manquant (à créer avec @BotFather sur Telegram)');
+  handler = onOwnerMessage;
+  const me = await api('getMe');
+  console.log(`[telegram] Robot : @${me.username}`);
+  if (!OWNER_IDS.length) console.log('[telegram] OWNER_TELEGRAM_ID absent : envoie /start au robot, il te donnera ton identifiant.');
+  await api('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
+  poll();
 }
