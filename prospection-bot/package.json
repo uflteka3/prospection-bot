@@ -1,0 +1,17 @@
+{
+  "name": "prospection-bot",
+  "version": "1.1.0",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node src/index.js" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "node-cron": "^3.0.3",
+    "pino": "^9.0.0",
+    "puppeteer": "^23.0.0",
+    "qrcode": "^1.5.4"
+  }
+}

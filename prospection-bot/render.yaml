@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: diao-prospection-bot
+    runtime: docker
+    # Un robot WhatsApp doit rester allumé et garder ses fichiers : il faut une offre payante avec disque
+    plan: starter
+    healthCheckPath: /
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: OWNER_NUMBER
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: LLM_PROVIDER
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: SEARCH_PROVIDER
+        sync: false
+      - key: SEARCH_API_KEY
+        sync: false
